@@ -52,6 +52,8 @@ pub enum Terminator {
 #[serde(deny_unknown_fields)]
 pub struct Settings {
     #[serde(default)]
+    pub prompt: crate::fields::PromptSettings,
+    #[serde(default)]
     pub trigger_mode: TriggerMode,
     #[serde(default = "default_terminators")]
     pub terminators: Vec<Terminator>,
@@ -101,6 +103,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            prompt: crate::fields::PromptSettings::default(),
             trigger_mode: TriggerMode::Immediate,
             terminators: default_terminators(),
             word_separators: None,
@@ -323,7 +326,7 @@ impl AppFilter {
         Ok(())
     }
 
-    fn matches(&self, app: &crate::app::AppInfo) -> bool {
+    pub(crate) fn matches(&self, app: &crate::app::AppInfo) -> bool {
         field_matches(self.title.as_deref(), app.title.as_deref())
             && field_matches(self.class.as_deref(), app.class.as_deref())
             && field_matches(self.exec.as_deref(), app.exec.as_deref())
@@ -348,6 +351,7 @@ pub struct Match {
     pub search_terms: Vec<String>,
     pub replace: String,
     pub vars: Vec<Variable>,
+    pub fields: Vec<crate::fields::Field>,
     pub word: bool,
     pub left_word: bool,
     pub right_word: bool,
@@ -518,6 +522,8 @@ struct MatchDefinition {
     replace: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     vars: Vec<Variable>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    fields: Vec<crate::fields::Field>,
     #[serde(default, skip_serializing_if = "is_false")]
     word: bool,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -631,6 +637,7 @@ impl Config {
                 search_terms: definition.search_terms,
                 replace: definition.replace,
                 vars,
+                fields: definition.fields,
                 word: definition.word,
                 left_word: definition.left_word,
                 right_word: definition.right_word,
@@ -644,6 +651,7 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.settings.prompt.validate()?;
         if self.settings.injection_delay_ms > 50 {
             bail!("injection_delay_ms must be between 0 and 50");
         }
@@ -685,6 +693,8 @@ impl Config {
             }
         }
         for item in &self.matches {
+            crate::fields::validate(&item.fields, &self.settings.prompt)
+                .with_context(|| format!("{}: fields", item.source.display()))?;
             if !item.propagate_case && item.uppercase_style != UppercaseStyle::Uppercase {
                 bail!(
                     "{}: uppercase_style requires propagate_case: true",
@@ -726,14 +736,35 @@ impl Config {
                 .as_ref()
                 .map(|pattern| regex::Regex::new(pattern))
                 .transpose()?;
-            let captures: Vec<&str> = regex
+            let mut captures: Vec<&str> = regex
                 .as_ref()
                 .map(|r| r.capture_names().flatten().collect())
                 .unwrap_or_default();
+            for field in &item.fields {
+                if captures.contains(&field.id.as_str())
+                    || item.vars.iter().any(|v| v.name == field.id)
+                {
+                    bail!(
+                        "{}: field '{}' collides with a variable or capture",
+                        item.source.display(),
+                        field.id
+                    );
+                }
+                captures.push(&field.id);
+            }
             crate::template::variable_order(&item.vars, &captures)
                 .with_context(|| format!("{}: variable dependencies", item.source.display()))?;
         }
         self.validate_match_references()?;
+        for index in 0..self.matches.len() {
+            if !self.matches[index].fields.is_empty() {
+                let authored =
+                    authored_template(index, self, &mut crate::template::Budget::default(), 1)?;
+                if authored.matches("$|$").count() > 1 {
+                    bail!("prompted snippet has multiple authored cursor stops");
+                }
+            }
+        }
         crate::groups::validate(&self.settings.snippet_groups)?;
         Ok(())
     }
@@ -862,6 +893,7 @@ impl Config {
                 .filter(|(shorter, shorter_item)| {
                     shorter.len() < trigger.len()
                         && trigger.starts_with(shorter)
+                        && shorter_item.fields.is_empty()
                         && !shorter_item.word
                         && !shorter_item.right_word
                 })
@@ -934,6 +966,12 @@ impl Config {
             .find(|item| item.all_triggers().contains(&trigger))
             .map(|item| item.search_terms.clone())
             .unwrap_or_default();
+        let previous_fields = file
+            .matches
+            .iter()
+            .find(|item| item.all_triggers().contains(&trigger))
+            .map(|item| item.fields.clone())
+            .unwrap_or_default();
         file.matches
             .retain(|item| !item.all_triggers().contains(&trigger));
         file.matches.push(MatchDefinition {
@@ -948,6 +986,7 @@ impl Config {
             },
             replace: expansion.to_string(),
             vars: Vec::new(),
+            fields: previous_fields,
             word: false,
             left_word: false,
             right_word: false,
@@ -1013,6 +1052,9 @@ fn validate_match_reference(
             );
         }
         let target = targets[0];
+        if !config.matches[target].fields.is_empty() {
+            bail!("nested match reference cannot target a prompted snippet");
+        }
         height = height.max(
             1 + validate_match_reference(target, config, by_trigger, visiting, visited, depth + 1)?,
         );
@@ -1023,6 +1065,62 @@ fn validate_match_reference(
     }
     visited.insert(index, height);
     Ok(height)
+}
+
+// Field/capture values are empty placeholders here: only authored markers count.
+fn authored_template(
+    index: usize,
+    config: &Config,
+    budget: &mut crate::template::Budget,
+    depth: usize,
+) -> Result<String> {
+    if depth > crate::template::MAX_DEPTH {
+        bail!("nested match depth exceeded");
+    }
+    budget.evaluate()?;
+    let item = &config.matches[index];
+    let regex = item
+        .regex
+        .as_ref()
+        .map(|v| regex::Regex::new(v))
+        .transpose()?;
+    let mut values = regex
+        .as_ref()
+        .map(|r| {
+            r.capture_names()
+                .flatten()
+                .map(|v| (v.to_string(), String::new()))
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+    values.extend(item.fields.iter().map(|f| (f.id.clone(), String::new())));
+    let names = values.keys().map(String::as_str).collect::<Vec<_>>();
+    for i in crate::template::variable_order(&item.vars, &names)? {
+        budget.evaluate()?;
+        let variable = &item.vars[i];
+        let text = match variable.kind {
+            VariableKind::Date => variable.params.format.clone().unwrap_or_default(),
+            VariableKind::Echo => {
+                let text = variable.params.echo.as_deref().unwrap_or_default();
+                if variable.inject_vars {
+                    budget.interpolate(text, &values, true)?
+                } else {
+                    budget.charge(text.len())?;
+                    text.to_string()
+                }
+            }
+            VariableKind::Match => {
+                let index = config
+                    .matches
+                    .iter()
+                    .position(|m| m.triggers.iter().any(|t| t == variable.params.trigger()))
+                    .context("missing nested match")?;
+                authored_template(index, config, budget, depth + 1)?
+            }
+        };
+        values.insert(variable.name.clone(), text);
+    }
+    budget.interpolate(&item.replace, &values, false)
 }
 
 fn normalized_search_terms(values: &[String]) -> Vec<String> {
@@ -1172,6 +1270,55 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn prompted_date_markers_are_validated_without_resolving_dates() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("match/date.yml");
+        write(&path,"matches:\n  - trigger: ';date'\n    replace: '{{today}}$|${{value}}'\n    fields: [{id: value, label: Value, type: text}]\n    vars: [{name: today, type: date, params: {format: '$|$'}}]\n");
+        assert!(Config::load_dir(dir.path())
+            .unwrap_err()
+            .to_string()
+            .contains("multiple authored cursor"));
+        write(&path,"matches:\n  - trigger: ';date'\n    replace: '{{today}}{{value}}'\n    fields: [{id: value, label: Value, type: text}]\n    vars: [{name: today, type: date, params: {format: '$|$'}}]\n");
+        assert!(Config::load_dir(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn prompt_definitions_validate_dependencies_and_survive_serialization() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("match/forms.yml");
+        let base = "matches:\n  - trigger: ';form'\n    replace: '{{copy}}'\n    fields:\n      - {id: value, label: Value, type: text, default: ''}\n    vars:\n      - {name: copy, type: echo, params: {echo: '{{value}}'}}\n";
+        write(&path, base);
+        let config = Config::load_dir(dir.path()).unwrap();
+        assert_eq!(config.matches[0].fields[0].id, "value");
+        let file: MatchFile = parse_yaml(base).unwrap();
+        let generated = GeneratedFile {
+            matches: file.matches,
+        };
+        let generated_path = dir.path().join("roundtrip.yml");
+        save_generated(&generated_path, &generated).unwrap();
+        assert_eq!(
+            load_generated(&generated_path).unwrap().matches[0].fields,
+            config.matches[0].fields
+        );
+        for bad in [base.replace("name: copy", "name: value"),
+            base.replace("replace: '{{copy}}'", "replace: '{{copy}}$|$$|$'"),
+            format!("{base}  - trigger: ';nested'\n    replace: '{{{{target}}}}'\n    vars:\n      - {{name: target, type: match, params: {{trigger: ';form'}}}}\n")] {
+            write(&path, &bad);
+            assert!(Config::load_dir(dir.path()).is_err());
+        }
+    }
+
+    #[test]
+    fn prompted_prefix_does_not_block_an_immediate_plain_trigger() {
+        let dir = TempDir::new().unwrap();
+        write(&dir.path().join("match/forms.yml"), "matches:\n  - trigger: ';f'\n    replace: '{{value}}'\n    fields: [{id: value, label: Value, type: text}]\n  - {trigger: ';foo', replace: 'plain'}\n");
+        assert!(Config::load_dir(dir.path())
+            .unwrap()
+            .unreachable_triggers()
+            .is_empty());
     }
 
     #[test]
@@ -1581,6 +1728,7 @@ matches:
                 search_terms: vec!["closing".into()],
                 replace: "Best,\nSilouan".into(),
                 vars: Vec::new(),
+                fields: Vec::new(),
                 word: false,
                 left_word: false,
                 right_word: false,

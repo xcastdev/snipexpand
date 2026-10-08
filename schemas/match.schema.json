@@ -284,6 +284,13 @@
             "capitalize",
             "capitalize_words"
           ]
+        },
+        "fields": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/definitions/field"
+          }
         }
       },
       "required": [
@@ -364,6 +371,94 @@
               "propagate_case": {
                 "const": true
               }
+            }
+          }
+        }
+      ]
+    },
+    "choice_option": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "label",
+        "value"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1
+        },
+        "value": {
+          "type": "string"
+        }
+      }
+    },
+    "field": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "label",
+        "type"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "enum": [
+            "text",
+            "choice"
+          ]
+        },
+        "default": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "options": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "$ref": "#/definitions/choice_option"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "choice"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "options"
+            ],
+            "properties": {
+              "options": {
+                "minItems": 1
+              }
+            }
+          },
+          "else": {
+            "not": {
+              "required": [
+                "options"
+              ]
             }
           }
         }

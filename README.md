@@ -27,6 +27,8 @@ Fast, config-based text expansion for Linux and Wayland. **First-class support f
 - Immediate Backspace undo for simple expansions
 - Application exclusions, per-application profiles, and persistent personal groups
 - Pause and resume controls through the CLI, IPC, and Omarchy plugin
+- Optional Space-triggered forms and choice pickers through a frontend-independent
+  [prompt IPC protocol](docs/prompt-ipc.md); the frontend runs separately
 - Deliberate duplicate-trigger selection by source
 - Git-published snippet packs with pinned revisions and explicit updates
 - Direct installation of strictly compatible Espanso packs

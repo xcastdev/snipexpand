@@ -15,6 +15,10 @@ pub struct KeyEvent {
 pub enum KeyboardEvent {
     Key(KeyEvent),
     Disconnected(PathBuf),
+    Connected {
+        device: PathBuf,
+        held_keys: Vec<u16>,
+    },
 }
 
 /// Merges key events from all physical keyboards into a single async stream.
@@ -131,20 +135,23 @@ fn read_device_loop(
     path: &std::path::Path,
     tx: &tokio::sync::mpsc::UnboundedSender<KeyboardEvent>,
 ) -> anyhow::Result<()> {
+    let held_keys = device.get_key_state()?.iter().map(|key| key.0).collect();
+    let _ = tx.send(KeyboardEvent::Connected {
+        device: path.to_path_buf(),
+        held_keys,
+    });
     loop {
         for event in device.fetch_events()? {
-            if event.event_type() == evdev::EventType::KEY {
-                tracing::debug!(code = event.code(), value = event.value(), "Keyboard event");
-                if tx
+            if event.event_type() == evdev::EventType::KEY
+                && tx
                     .send(KeyboardEvent::Key(KeyEvent {
                         device: path.to_path_buf(),
                         code: event.code(),
                         value: event.value(),
                     }))
                     .is_err()
-                {
-                    return Ok(()); // receiver dropped
-                }
+            {
+                return Ok(()); // receiver dropped
             }
         }
     }

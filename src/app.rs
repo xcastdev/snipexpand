@@ -63,6 +63,60 @@ pub fn detect() -> Result<AppInfo> {
     )
 }
 
+/// Prompt admission must not block the keyboard/IPC loop on a compositor tool.
+pub(crate) async fn detect_prompt() -> Result<AppInfo> {
+    let hyprland = std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some();
+    let mut command = tokio::process::Command::new(if hyprland { "hyprctl" } else { "wlrctl" });
+    if hyprland {
+        command.args(["activewindow", "-j"]);
+    } else {
+        command.args(["toplevel", "list", "state:active"]);
+    }
+    let bytes = prompt_query(command).await?;
+    if hyprland {
+        let window: HyprlandWindow = serde_json::from_slice(&bytes)?;
+        Ok(AppInfo {
+            title: nonempty(window.title),
+            class: nonempty(window.class),
+            exec: window.pid.and_then(executable_for_pid),
+        })
+    } else {
+        let line = String::from_utf8(bytes)?;
+        let (class, title) = line
+            .trim()
+            .split_once(": ")
+            .context("no active application")?;
+        Ok(AppInfo {
+            title: nonempty(title.into()),
+            class: nonempty(class.into()),
+            exec: None,
+        })
+    }
+}
+
+async fn prompt_query(mut command: tokio::process::Command) -> Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let mut child = command.spawn()?;
+    let stdout = child.stdout.take().context("missing query output")?;
+    tokio::time::timeout(std::time::Duration::from_millis(500), async {
+        let mut bytes = Vec::new();
+        stdout.take(65537).read_to_end(&mut bytes).await?;
+        if bytes.len() > 65536 {
+            anyhow::bail!("query output too large");
+        }
+        if !child.wait().await?.success() {
+            anyhow::bail!("query failed");
+        }
+        Ok(bytes)
+    })
+    .await
+    .context("query timed out")?
+}
+
 fn detect_hyprland() -> Result<AppInfo> {
     let output = Command::new("hyprctl")
         .args(["activewindow", "-j"])
@@ -119,6 +173,19 @@ fn nonempty(value: String) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn prompt_query_is_bounded_and_does_not_block_the_runtime() {
+        let mut sleeping = tokio::process::Command::new("sleep");
+        sleeping.arg("5");
+        let query = tokio::spawn(prompt_query(sleeping));
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(!query.is_finished());
+        assert!(query.await.unwrap().is_err());
+        let mut oversized = tokio::process::Command::new("head");
+        oversized.args(["-c", "65537", "/dev/zero"]);
+        assert!(prompt_query(oversized).await.is_err());
+    }
 
     #[test]
     fn empty_strings_become_missing_properties() {

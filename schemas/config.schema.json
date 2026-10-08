@@ -165,6 +165,102 @@
       "minimum": 0,
       "maximum": 100,
       "default": 10
+    },
+    "prompt": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ack_timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400000,
+          "default": 2000
+        },
+        "lease_renewal_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400000,
+          "default": 5000
+        },
+        "lease_expiry_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400000,
+          "default": 15000
+        },
+        "completion_timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400000,
+          "default": 300000
+        },
+        "release_timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400000,
+          "default": 2000
+        },
+        "close_timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400000,
+          "default": 2000
+        },
+        "focus_settle_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 60000,
+          "default": 150
+        },
+        "max_connections": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16,
+          "default": 16
+        },
+        "max_frame_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65536,
+          "default": 65536
+        },
+        "max_queued_messages": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 32,
+          "default": 32
+        },
+        "max_fields": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64,
+          "default": 64
+        },
+        "max_options": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 128,
+          "default": 128
+        },
+        "max_answer_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4096,
+          "default": 4096
+        },
+        "max_request_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65536,
+          "default": 65536
+        },
+        "max_output_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4000,
+          "default": 4000
+        }
+      }
     }
   },
   "definitions": {

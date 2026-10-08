@@ -1,0 +1,34 @@
+matches:
+  - trigger: ';pick'
+    replace: '{{choice}}'
+    fields:
+      - id: choice
+        label: Pick a value
+        type: choice
+        default: first
+        options:
+          - {id: first, label: First, value: chosen}
+          - {id: second, label: Second, value: alternate}
+  - trigger: ';form'
+    replace: '{{name}}|{{details}}'
+    fields:
+      - {id: name, label: Name, type: text, default: Alice}
+      - {id: details, label: Details, type: text, default: literal}
+  - trigger: ';empty'
+    replace: 'a{{value}}b'
+    fields:
+      - {id: value, label: Empty is valid, type: text, default: ''}
+  - trigger: ';literal'
+    replace: '{{value}}'
+    fields:
+      - id: value
+        label: Literal Unicode and multiline
+        type: text
+        default: "é🙂{{secret}}$|$\n下一行"
+  - trigger: ';bmp'
+    replace: '{{value}}'
+    fields:
+      - id: value
+        label: Literal BMP Unicode and multiline
+        type: text
+        default: "é{{secret}}$|$\n下一行"

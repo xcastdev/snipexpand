@@ -24,6 +24,12 @@ use xkbcommon::xkb;
 
 use crate::config::InjectionBackend;
 use crate::fcitx5::DirectCommitResult;
+use crate::prompt_injection::{
+    prepare_prompt_operation, CommitToken, PreparedOperation, PreparedPrompt, PromptError,
+    PromptKeyboard, PromptOutcome,
+};
+use std::time::{Duration, Instant};
+use tokio::sync::oneshot;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -146,8 +152,24 @@ fn keysym_to_char(keysym: xkb::Keysym) -> Option<char> {
 // Injection commands
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
 enum InjectionCmd {
+    PreparePrompt {
+        original: String,
+        text: String,
+        cursor_back: usize,
+        settle_ms: u64,
+        deadline: Instant,
+        done: oneshot::Sender<std::result::Result<PreparedPrompt, PromptError>>,
+    },
+    CommitPrompt {
+        handle: PreparedPrompt,
+        token: Arc<CommitToken>,
+        delay_ms: u64,
+        settle_ms: u64,
+        deadline: Instant,
+        done: oneshot::Sender<PromptOutcome>,
+    },
+    DiscardPrompt(PreparedPrompt),
     Key {
         code: u16,
         value: i32,
@@ -203,6 +225,20 @@ enum CursorMove {
 }
 
 impl Injector {
+    #[cfg(test)]
+    pub(crate) fn keymap_only_for_test() -> Self {
+        let (tx, _) = mpsc::sync_channel(1);
+        Self {
+            tx,
+            keymap: KeymapLookup::build_default_data().lookup,
+            delay_ms: Arc::new(AtomicU64::new(0)),
+            settle_ms: AtomicU64::new(0),
+            compose_delay_ms: AtomicU64::new(0),
+            compose_settle_ms: AtomicU64::new(0),
+            backend: "uinput",
+        }
+    }
+
     pub fn spawn(options: InjectorOptions) -> Result<Self> {
         let InjectorOptions {
             backend,
@@ -284,6 +320,67 @@ impl Injector {
             compose_delay_ms: AtomicU64::new(compose_timing.delay_ms),
             compose_settle_ms: AtomicU64::new(compose_timing.settle_ms),
             backend: active_backend,
+        })
+    }
+
+    /// Admit one whole preparation without blocking the daemon on the worker.
+    pub(crate) fn prepare_prompt(
+        &self,
+        original: String,
+        text: String,
+        cursor_back: usize,
+        deadline: Instant,
+    ) -> std::result::Result<
+        oneshot::Receiver<std::result::Result<PreparedPrompt, PromptError>>,
+        PromptError,
+    > {
+        if original.is_empty() || original.len() > 4000 || text.len() > 4000 {
+            return Err(PromptError::InvalidOutput);
+        }
+        if Instant::now() >= deadline {
+            return Err(PromptError::Expired);
+        }
+        let (done, receiver) = oneshot::channel();
+        self.try_prompt_command(InjectionCmd::PreparePrompt {
+            original,
+            text,
+            cursor_back,
+            settle_ms: self.settle_ms.load(Ordering::Relaxed),
+            deadline,
+            done,
+        })?;
+        Ok(receiver)
+    }
+
+    pub(crate) fn commit_prompt(
+        &self,
+        handle: PreparedPrompt,
+        token: Arc<CommitToken>,
+        deadline: Instant,
+    ) -> std::result::Result<oneshot::Receiver<PromptOutcome>, PromptError> {
+        let (done, receiver) = oneshot::channel();
+        self.try_prompt_command(InjectionCmd::CommitPrompt {
+            handle,
+            token,
+            delay_ms: self.delay_ms.load(Ordering::Relaxed),
+            settle_ms: self.settle_ms.load(Ordering::Relaxed),
+            deadline,
+            done,
+        })?;
+        Ok(receiver)
+    }
+
+    pub(crate) fn discard_prompt(
+        &self,
+        handle: PreparedPrompt,
+    ) -> std::result::Result<(), PromptError> {
+        self.try_prompt_command(InjectionCmd::DiscardPrompt(handle))
+    }
+
+    fn try_prompt_command(&self, command: InjectionCmd) -> std::result::Result<(), PromptError> {
+        self.tx.try_send(command).map_err(|error| match error {
+            mpsc::TrySendError::Full(_) => PromptError::Busy,
+            mpsc::TrySendError::Disconnected(_) => PromptError::Unavailable,
         })
     }
 
@@ -538,7 +635,7 @@ fn cursor_move(text: &str, chars_after: usize) -> CursorMove {
 // Injection transports
 // ---------------------------------------------------------------------------
 
-trait KeyboardTransport {
+pub(crate) trait KeyboardTransport {
     fn send_key(&mut self, code: u16, value: i32) -> Result<()>;
 
     fn send_text(
@@ -553,6 +650,10 @@ trait KeyboardTransport {
 
     fn flush(&mut self) -> Result<()> {
         Ok(())
+    }
+
+    fn validate_prompt_text(&self, _text: &str) -> Result<()> {
+        anyhow::bail!("prompt text is unsupported")
     }
 
     fn refresh_text_keymap(&mut self, _characters: &str) -> Result<()> {
@@ -1105,8 +1206,12 @@ impl KeyboardTransport for WaylandKeyboard {
         Ok(())
     }
 
+    fn validate_prompt_text(&self, text: &str) -> Result<()> {
+        resolve_wayland_text(&self.text_codes, text, false).map(|_| ())
+    }
+
     fn refresh_text_keymap(&mut self, characters: &str) -> Result<()> {
-        let mut keyboards = Vec::new();
+        let mut keyboards: Vec<ZwpVirtualKeyboardV1> = Vec::new();
         let mut codes = HashMap::new();
         for (keyboard_index, (text_keymap, text_codes)) in
             build_text_keymaps(characters).into_iter().enumerate()
@@ -1114,7 +1219,13 @@ impl KeyboardTransport for WaylandKeyboard {
             let keyboard = self
                 .manager
                 .create_virtual_keyboard(&self.seat, &self.queue_handle, ());
-            upload_keymap(&keyboard, &text_keymap)?;
+            if let Err(error) = upload_keymap(&keyboard, &text_keymap) {
+                keyboard.destroy();
+                for created in keyboards {
+                    created.destroy();
+                }
+                return Err(error);
+            }
             keyboards.push(keyboard);
             codes.extend(
                 text_codes
@@ -1122,9 +1233,12 @@ impl KeyboardTransport for WaylandKeyboard {
                     .map(|(character, code)| (character, (keyboard_index, code))),
             );
         }
-        self.connection
-            .roundtrip()
-            .context("activate refreshed Wayland text keymaps")?;
+        if let Err(error) = self.connection.roundtrip() {
+            for created in keyboards {
+                created.destroy();
+            }
+            return Err(error).context("activate refreshed Wayland text keymaps");
+        }
         for keyboard in self.text_keyboards.drain(..) {
             keyboard.destroy();
         }
@@ -1414,8 +1528,96 @@ fn injection_thread(
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
-    while let Ok(command) = cmd_rx.recv() {
+    let lookup = KeymapLookup::build(keymap);
+    let mut configured_chars = wayland_text_chars.to_owned();
+    let mut prepared: Option<PreparedOperation> = None;
+    let mut next_handle = 1u64;
+    loop {
+        if prepared
+            .as_ref()
+            .is_some_and(|value| Instant::now() >= value.deadline)
+        {
+            prepared = None;
+        }
+        let command = match cmd_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(command) => command,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         match command {
+            InjectionCmd::PreparePrompt {
+                original,
+                text,
+                cursor_back,
+                settle_ms,
+                deadline,
+                done,
+            } => {
+                let result = if next_handle == u64::MAX {
+                    Err(PromptError::Unavailable)
+                } else if prepared.is_some() {
+                    Err(PromptError::Busy)
+                } else {
+                    prepare_prompt_operation(
+                        &mut *keyboard,
+                        name,
+                        &lookup,
+                        &configured_chars,
+                        original,
+                        text,
+                        cursor_back,
+                        settle_ms,
+                        deadline,
+                        PreparedPrompt(next_handle),
+                        delay_ms.load(Ordering::Relaxed),
+                    )
+                };
+                match result {
+                    Ok(operation) => {
+                        next_handle = next_handle.saturating_add(1);
+                        let handle = operation.handle;
+                        if done.send(Ok(handle)).is_ok() {
+                            prepared = Some(operation);
+                        }
+                    }
+                    Err(error) => {
+                        let _ = done.send(Err(error));
+                    }
+                }
+            }
+            InjectionCmd::CommitPrompt {
+                handle,
+                token,
+                delay_ms,
+                settle_ms,
+                deadline,
+                done,
+            } => {
+                let outcome = if prepared
+                    .as_ref()
+                    .is_some_and(|value| value.handle == handle)
+                {
+                    let mut operation = prepared.take().expect("matched prepared operation");
+                    operation.delay_ms = delay_ms;
+                    operation.settle_ms = settle_ms;
+                    let mut transport = PromptKeyboard {
+                        keyboard: &mut *keyboard,
+                        delay_ms: operation.delay_ms,
+                    };
+                    operation.execute(&mut transport, &token, deadline)
+                } else {
+                    PromptOutcome::FailedBeforeMutation(PromptError::InvalidHandle)
+                };
+                let _ = done.send(outcome);
+            }
+            InjectionCmd::DiscardPrompt(handle) => {
+                if prepared
+                    .as_ref()
+                    .is_some_and(|value| value.handle == handle)
+                {
+                    prepared = None;
+                }
+            }
             InjectionCmd::Text {
                 text,
                 compose_non_bmp,
@@ -1457,6 +1659,8 @@ fn injection_thread(
                 let _ = done.send(result);
             }
             InjectionCmd::RefreshTextKeymap { characters, done } => {
+                prepared = None;
+                configured_chars = characters.clone();
                 let result = keyboard
                     .refresh_text_keymap(&characters)
                     .map_err(|error| error.to_string());
@@ -1888,5 +2092,44 @@ mod tests {
             CursorMove::Line { up: 1, column: 3 }
         );
         assert_eq!(cursor_move("****", 2), CursorMove::Left(2));
+    }
+}
+
+#[cfg(test)]
+mod prompted_tests {
+    use super::*;
+    fn lookup() -> KeymapLookup {
+        KeymapLookup {
+            table: HashMap::new(),
+            input_table: HashMap::new(),
+        }
+    }
+    #[test]
+    fn admission_is_nonblocking_when_worker_queue_is_full_or_stopped() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let injector = Injector {
+            tx: sender,
+            keymap: lookup(),
+            delay_ms: Arc::new(AtomicU64::new(0)),
+            settle_ms: AtomicU64::new(0),
+            compose_delay_ms: AtomicU64::new(0),
+            compose_settle_ms: AtomicU64::new(0),
+            backend: "uinput",
+        };
+        injector.discard_prompt(PreparedPrompt(1)).unwrap();
+        assert!(matches!(
+            injector.prepare_prompt(
+                "trigger ".into(),
+                "a ".into(),
+                0,
+                Instant::now() + Duration::from_secs(1)
+            ),
+            Err(PromptError::Busy)
+        ));
+        drop(receiver);
+        assert!(matches!(
+            injector.discard_prompt(PreparedPrompt(1)),
+            Err(PromptError::Unavailable)
+        ));
     }
 }

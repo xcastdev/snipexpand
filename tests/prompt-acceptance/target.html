@@ -1,0 +1,9 @@
+<!doctype html><meta charset="utf-8"><title>SnipExpand isolated target</title>
+<style>textarea {font:24px monospace;width:95vw;height:70vh}</style>
+<textarea id="target" autofocus></textarea>
+<script>
+const target=document.querySelector('#target');
+function report(event) {fetch('/state',{method:'POST',body:JSON.stringify({text:target.value,caret:target.selectionStart,event:event.type,trusted:event.isTrusted})});}
+for(const event of ['input','keyup','focus','blur']) target.addEventListener(event,report);
+target.focus();
+</script>

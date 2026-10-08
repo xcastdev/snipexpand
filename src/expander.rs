@@ -18,8 +18,10 @@ pub struct Expander {
     trigger_mode: TriggerMode,
     terminators: Vec<char>,
     word_separators: Option<Vec<char>>,
+    pending_prompt: Option<DeferredMatch>,
 }
 
+#[derive(Clone)]
 pub(crate) struct CompiledMatch {
     trigger: String,
     regex: Option<regex::Regex>,
@@ -27,6 +29,7 @@ pub(crate) struct CompiledMatch {
     ambiguous: bool,
     replace: String,
     vars: Vec<crate::config::Variable>,
+    fields: Vec<crate::fields::Field>,
     left_word: bool,
     right_word: bool,
     propagate_case: bool,
@@ -47,6 +50,7 @@ impl IntoCompiledMatches for Match {
                 ambiguous: false,
                 replace: self.replace.clone(),
                 vars: self.vars.clone(),
+                fields: self.fields.clone(),
                 left_word: self.word || self.left_word,
                 right_word: self.word || self.right_word,
                 propagate_case: self.propagate_case,
@@ -64,6 +68,7 @@ impl IntoCompiledMatches for Match {
                 ambiguous: false,
                 replace: self.replace,
                 vars: self.vars,
+                fields: self.fields,
                 left_word: self.word || self.left_word,
                 right_word: self.word || self.right_word,
                 propagate_case: self.propagate_case,
@@ -82,6 +87,7 @@ impl IntoCompiledMatches for (String, String) {
             ambiguous: false,
             replace: self.1,
             vars: Vec::new(),
+            fields: Vec::new(),
             left_word: false,
             right_word: false,
             propagate_case: false,
@@ -119,6 +125,7 @@ impl Expander {
             trigger_mode,
             terminators,
             word_separators,
+            pending_prompt: None,
         }
     }
 
@@ -144,6 +151,7 @@ impl Expander {
         if matches.iter().any(|item| item.regex.is_some()) {
             self.max_trigger_len = self.max_trigger_len.max(regex_max_buffer);
         }
+        self.pending_prompt = None;
         self.matches = matches;
         self.trigger_mode = trigger_mode;
         self.terminators = terminators;
@@ -154,6 +162,18 @@ impl Expander {
     pub fn push_char(&mut self, c: char) -> Option<Expansion> {
         if self.max_trigger_len == 0 {
             return None;
+        }
+        self.pending_prompt = None;
+        if c == ' ' && !(self.trigger_mode == TriggerMode::Space && self.terminators.contains(&c)) {
+            let had_input = !self.buffer.is_empty();
+            let expansion = self.find_match(Some(c));
+            if expansion.is_some()
+                || self.pending_prompt.is_some()
+                || (had_input && self.buffer.is_empty())
+            {
+                self.buffer.clear();
+                return expansion;
+            }
         }
         if self.trigger_mode == TriggerMode::Space && self.terminators.contains(&c) {
             let expansion = self.find_match(Some(c));
@@ -192,7 +212,20 @@ impl Expander {
         let terminator_count = usize::from(terminator.is_some());
 
         for item in &self.matches {
-            if item.ambiguous {
+            if item.ambiguous || (!item.fields.is_empty() && terminator != Some(' ')) {
+                continue;
+            }
+            if self.trigger_mode == TriggerMode::Space
+                && item.fields.is_empty()
+                && terminator.is_some_and(|c| !self.terminators.contains(&c))
+            {
+                continue;
+            }
+            if self.trigger_mode == TriggerMode::Immediate
+                && terminator.is_some()
+                && item.fields.is_empty()
+                && (!item.right_word || terminator.is_some_and(|c| !self.is_word_separator(c)))
+            {
                 continue;
             }
             if terminator_count == 0 && item.right_word {
@@ -208,6 +241,19 @@ impl Expander {
                     continue;
                 }
                 let delete_count = typed_trigger.chars().count() + terminator_count;
+                if !item.fields.is_empty() {
+                    self.pending_prompt = Some(DeferredMatch {
+                        fields: item.fields.clone(),
+                        original: format!("{typed_trigger} "),
+                        delete_count,
+                        item: item.clone(),
+                        matches: self.matches.clone(),
+                        captures,
+                        typed_trigger,
+                    });
+                    self.buffer.clear();
+                    return None;
+                }
                 let rendered = apply_propagated_case(
                     match render(&self.matches, item, &captures, chrono::Utc::now()) {
                         Ok(text) => text,
@@ -220,6 +266,11 @@ impl Expander {
                     item,
                     &typed_trigger,
                 );
+                let rendered = if self.trigger_mode == TriggerMode::Immediate {
+                    terminator.map_or(rendered.clone(), |c| format!("{rendered}{c}"))
+                } else {
+                    rendered
+                };
                 let (text, cursor_back) = prepare_replacement(&rendered);
                 self.buffer.clear();
                 return Some(Expansion {
@@ -240,7 +291,7 @@ impl Expander {
         let mut buf_str: String = self.buffer.iter().collect();
         buf_str.pop();
         for item in &self.matches {
-            if item.ambiguous {
+            if item.ambiguous || !item.fields.is_empty() {
                 continue;
             }
             if !item.right_word {
@@ -282,11 +333,16 @@ impl Expander {
         None
     }
 
+    pub fn take_prompt(&mut self) -> Option<DeferredMatch> {
+        self.pending_prompt.take()
+    }
+
     pub fn pop_char(&mut self) {
         self.buffer.pop_back();
     }
 
     pub fn reset(&mut self) {
+        self.pending_prompt = None;
         self.buffer.clear();
     }
 
@@ -302,6 +358,9 @@ impl Expander {
         }) else {
             return Ok(None);
         };
+        if !item.fields.is_empty() {
+            anyhow::bail!("requires_prompt: use physical Space with a registered prompt handler");
+        }
         let (text, cursor_back) = prepare_replacement(&render(
             &self.matches,
             item,
@@ -533,6 +592,192 @@ fn render_bounded(
     budget.interpolate(&item.replace, &values, false)
 }
 
+/// An immutable candidate; values are supplied only after protocol validation.
+pub struct DeferredMatch {
+    pub fields: Vec<crate::fields::Field>,
+    pub original: String,
+    pub delete_count: usize,
+    item: CompiledMatch,
+    matches: Vec<CompiledMatch>,
+    captures: HashMap<String, String>,
+    typed_trigger: String,
+}
+
+#[derive(Clone)]
+enum Segment {
+    Authored(String),
+    Literal(String),
+    Cursor,
+}
+
+fn authored(text: &str) -> Vec<Segment> {
+    let mut result = Vec::new();
+    for (i, piece) in text.split("$|$").enumerate() {
+        if i > 0 {
+            result.push(Segment::Cursor);
+        }
+        result.push(Segment::Authored(piece.to_string()));
+    }
+    result
+}
+fn interpolate_segments(
+    text: &str,
+    values: &HashMap<String, Vec<Segment>>,
+    strict: bool,
+    budget: &mut crate::template::Budget,
+) -> Result<Vec<Segment>> {
+    let mut result = Vec::new();
+    for part in crate::template::parts(text) {
+        match part {
+            crate::template::Part::Text(text) => {
+                budget.charge(text.len())?;
+                result.extend(authored(text));
+            }
+            crate::template::Part::Reference(name) => {
+                if let Some(value) = values.get(name) {
+                    for segment in value {
+                        budget.charge(match segment {
+                            Segment::Authored(v) | Segment::Literal(v) => v.len(),
+                            Segment::Cursor => 0,
+                        })?;
+                    }
+                    result.extend(value.clone());
+                } else if strict {
+                    anyhow::bail!("unknown echo reference");
+                } else {
+                    let text = format!("{{{{{name}}}}}");
+                    budget.charge(text.len())?;
+                    result.extend(authored(&text));
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+fn render_segments(
+    matches: &[CompiledMatch],
+    item: &CompiledMatch,
+    inputs: &HashMap<String, String>,
+    now: chrono::DateTime<chrono::Utc>,
+    budget: &mut crate::template::Budget,
+    depth: usize,
+) -> Result<Vec<Segment>> {
+    if depth > crate::template::MAX_DEPTH {
+        anyhow::bail!("nested match depth exceeded");
+    }
+    budget.evaluate()?;
+    let names = inputs.keys().map(String::as_str).collect::<Vec<_>>();
+    let order = crate::template::variable_order(&item.vars, &names)?;
+    let mut values = inputs
+        .iter()
+        .map(|(k, v)| (k.clone(), vec![Segment::Literal(v.clone())]))
+        .collect::<HashMap<_, _>>();
+    for index in order {
+        budget.evaluate()?;
+        let variable = &item.vars[index];
+        let value = match variable.kind {
+            VariableKind::Date => {
+                let value = crate::date::render(&variable.params, now)?;
+                budget.charge(value.len())?;
+                authored(&value)
+            }
+            VariableKind::Echo => {
+                let text = variable
+                    .params
+                    .echo
+                    .as_deref()
+                    .context("missing echo parameter")?;
+                if variable.inject_vars {
+                    interpolate_segments(text, &values, true, budget)?
+                } else {
+                    budget.charge(text.len())?;
+                    authored(text)
+                }
+            }
+            VariableKind::Match => {
+                let mut candidates = matches
+                    .iter()
+                    .filter(|c| c.regex.is_none() && c.trigger == variable.params.trigger());
+                let candidate = candidates.next().context("missing nested match")?;
+                if candidates.next().is_some() || !candidate.fields.is_empty() {
+                    anyhow::bail!("invalid nested match");
+                }
+                render_segments(matches, candidate, &HashMap::new(), now, budget, depth + 1)?
+            }
+        };
+        values.insert(variable.name.clone(), value);
+    }
+    interpolate_segments(&item.replace, &values, false, budget)
+}
+impl DeferredMatch {
+    pub fn render(&self, answers: &HashMap<String, String>) -> Result<Expansion> {
+        if answers.len() != self.fields.len()
+            || self.fields.iter().any(|f| !answers.contains_key(&f.id))
+        {
+            anyhow::bail!("missing or unexpected field answers");
+        }
+        let mut inputs = self.captures.clone();
+        inputs.extend(answers.clone());
+        let segments = render_segments(
+            &self.matches,
+            &self.item,
+            &inputs,
+            chrono::Utc::now(),
+            &mut crate::template::Budget::default(),
+            1,
+        )?;
+        let mut letters = self.typed_trigger.chars().filter(|c| c.is_alphabetic());
+        let capitalize = self.item.propagate_case && letters.next().is_some_and(char::is_uppercase);
+        let uppercase = capitalize && letters.next().is_some_and(char::is_uppercase);
+        let words = self.item.uppercase_style == UppercaseStyle::CapitalizeWords;
+        let mut first = true;
+        let mut word_start = true;
+        let mut text = String::new();
+        let mut marker = None;
+        for segment in segments {
+            let literal = matches!(&segment, Segment::Literal(_));
+            match segment {
+                Segment::Cursor => {
+                    if marker.is_some() {
+                        anyhow::bail!("multiple authored cursor stops are unsupported");
+                    }
+                    marker = Some(text.chars().count());
+                }
+                Segment::Authored(value) | Segment::Literal(value) => {
+                    // Literal segments advance capitalization state without changing answer bytes.
+                    for character in value.chars() {
+                        if !literal
+                            && capitalize
+                            && (uppercase
+                                || (words && word_start && character.is_alphabetic())
+                                || (!words && first))
+                        {
+                            text.extend(character.to_uppercase());
+                        } else {
+                            text.push(character);
+                        }
+                        first = false;
+                        word_start = !(character.is_alphanumeric() || character == '_');
+                    }
+                }
+            }
+        }
+        text.push(' ');
+        // Keyboard Left movement is reliable for a single ASCII line only.
+        let cursor_back = if text.is_ascii() && !text.contains(['\n', '\r', '\t']) {
+            marker.map_or(0, |position| text.chars().count() - position)
+        } else {
+            0
+        };
+        Ok(Expansion {
+            delete_count: self.delete_count,
+            text,
+            cursor_back,
+            undo_text: self.original.clone(),
+        })
+    }
+}
+
 fn prepare_replacement(replacement: &str) -> (String, usize) {
     let Some(marker) = replacement.find("$|$") else {
         return (replacement.to_string(), 0);
@@ -561,6 +806,7 @@ mod tests {
             search_terms: Vec::new(),
             replace: replace.to_string(),
             vars: Vec::new(),
+            fields: Vec::new(),
             word: false,
             left_word: false,
             right_word: false,
@@ -568,6 +814,160 @@ mod tests {
             uppercase_style: UppercaseStyle::Uppercase,
             source: PathBuf::from("test.yml"),
         }
+    }
+
+    fn prompted(trigger: &str, replacement: &str) -> Match {
+        let mut item = structured_match(trigger, replacement);
+        item.fields = vec![crate::fields::Field {
+            id: "value".into(),
+            label: "Value".into(),
+            kind: crate::fields::FieldKind::Text,
+            default: None,
+            options: Vec::new(),
+        }];
+        item
+    }
+
+    #[test]
+    fn prompts_wait_for_space_in_both_modes_and_answers_remain_literal() {
+        for mode in [TriggerMode::Immediate, TriggerMode::Space] {
+            let mut e = Expander::new(
+                vec![prompted(";form", "before {{value}} {{value}}$|$end")],
+                mode,
+            );
+            for c in ";form".chars() {
+                assert!(e.push_char(c).is_none());
+                assert!(e.take_prompt().is_none());
+            }
+            assert!(e.push_char(' ').is_none());
+            let prompt = e.take_prompt().unwrap();
+            assert_eq!(prompt.original, ";form ");
+            let answer = "{{other}}$|$";
+            let expansion = prompt
+                .render(&HashMap::from([("value".into(), answer.into())]))
+                .unwrap();
+            assert_eq!(expansion.text, "before {{other}}$|$ {{other}}$|$end ");
+            assert_eq!(expansion.cursor_back, 4);
+            assert_eq!(expansion.delete_count, 6);
+        }
+    }
+
+    #[test]
+    fn prompt_literal_provenance_survives_echo_and_capitalization() {
+        let mut item = prompted(";form", "{{copy}} hello$|$");
+        item.propagate_case = true;
+        item.vars = vec![crate::config::Variable {
+            name: "copy".into(),
+            kind: VariableKind::Echo,
+            inject_vars: true,
+            params: crate::config::VariableParams {
+                echo: Some("{{value}}".into()),
+                ..Default::default()
+            },
+        }];
+        let mut e = Expander::new(vec![item], TriggerMode::Immediate);
+        for c in ";FORM ".chars() {
+            assert!(e.push_char(c).is_none());
+        }
+        let expansion = e
+            .take_prompt()
+            .unwrap()
+            .render(&HashMap::from([("value".into(), "é\n{{copy}}$|$".into())]))
+            .unwrap();
+        assert_eq!(expansion.text, "é\n{{copy}}$|$ HELLO ");
+        assert_eq!(expansion.cursor_back, 0);
+    }
+
+    #[test]
+    fn prompts_do_not_change_plain_custom_terminators() {
+        let mut e = Expander::new_configured(
+            vec![
+                prompted(";form", "{{value}}"),
+                structured_match("two words", "plain"),
+            ],
+            TriggerMode::Space,
+            vec!['\n'],
+            None,
+            256,
+        );
+        for c in "two words".chars() {
+            assert!(e.push_char(c).is_none());
+        }
+        assert_eq!(e.push_char('\n').unwrap().text, "plain");
+        for c in ";form ".chars() {
+            assert!(e.push_char(c).is_none());
+        }
+        assert!(e.take_prompt().is_some());
+    }
+
+    #[test]
+    fn physical_space_preserves_plain_custom_separator_behavior() {
+        let mut plain = structured_match(";foo", "ordinary");
+        plain.right_word = true;
+        let mut e = Expander::new_configured(
+            vec![plain, prompted(";form", "{{value}}")],
+            TriggerMode::Immediate,
+            vec![' '],
+            Some(vec!['.']),
+            256,
+        );
+        for c in ";foo ".chars() {
+            assert!(e.push_char(c).is_none());
+        }
+        assert!(e.take_prompt().is_none());
+        e.reset();
+        for c in ";foo".chars() {
+            assert!(e.push_char(c).is_none());
+        }
+        assert_eq!(e.push_char('.').unwrap().text, "ordinary.");
+        e.reset();
+        for c in ";form ".chars() {
+            assert!(e.push_char(c).is_none());
+        }
+        assert!(e.take_prompt().is_some());
+    }
+
+    #[test]
+    fn prompt_never_expands_on_enter_tab_or_punctuation() {
+        for c in ['\n', '\t', '.'] {
+            let mut e = Expander::new_configured(
+                vec![prompted(";form", "{{value}}")],
+                TriggerMode::Space,
+                vec![' ', '\n', '\t'],
+                None,
+                256,
+            );
+            for c in ";form".chars() {
+                e.push_char(c);
+            }
+            assert!(e.push_char(c).is_none());
+            assert!(e.take_prompt().is_none());
+        }
+    }
+
+    #[test]
+    fn prompted_manual_render_requires_handler_and_empty_answer_is_valid() {
+        let mut e = Expander::new(
+            vec![prompted(";form", "a{{value}}b")],
+            TriggerMode::Immediate,
+        );
+        assert!(e
+            .expansion_for_trigger(";form", None)
+            .unwrap_err()
+            .to_string()
+            .starts_with("requires_prompt"));
+        for c in ";form ".chars() {
+            e.push_char(c);
+        }
+        let prompt = e.take_prompt().unwrap();
+        assert!(prompt.render(&HashMap::new()).is_err());
+        assert_eq!(
+            prompt
+                .render(&HashMap::from([("value".into(), String::new())]))
+                .unwrap()
+                .text,
+            "ab "
+        );
     }
 
     fn make_expander() -> Expander {

@@ -1,0 +1,1 @@
+{"name": "snipexpand-acceptance", "displayName": "SnipExpand isolated acceptance fixture", "version": "0.0.1", "engines": {"vscode": "^1.80.0"}, "activationEvents": ["onStartupFinished"], "main": "extension.js", "contributes": {"keybindings": [{"command": "snipexpandAcceptance.focus", "key": "f8"}]}}

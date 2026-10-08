@@ -4,6 +4,7 @@ mod daemon;
 mod date;
 mod expander;
 mod fcitx5;
+mod fields;
 mod groups;
 mod injector;
 mod ipc;
@@ -11,6 +12,8 @@ mod keyboard;
 mod packs;
 mod permissions;
 mod preview;
+mod prompt;
+mod prompt_injection;
 mod template;
 
 use clap::{Parser, Subcommand};
@@ -534,6 +537,8 @@ struct ListEntry {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     search_terms: Vec<String>,
     replacement: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    fields: Vec<fields::Field>,
     source: String,
     generated: bool,
     editable: bool,
@@ -565,6 +570,7 @@ fn list_entries(config: &config::Config) -> Vec<ListEntry> {
                     label: item.label.clone(),
                     search_terms: item.search_terms.clone(),
                     replacement: item.replace.clone(),
+                    fields: item.fields.clone(),
                     source: item.source.display().to_string(),
                     generated,
                     editable: generated,
@@ -1017,6 +1023,7 @@ mod tests {
             search_terms: vec!["example".into()],
             replace: format!("{trigger} replacement"),
             vars: Vec::new(),
+            fields: Vec::new(),
             word: false,
             left_word: false,
             right_word: false,
